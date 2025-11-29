@@ -1,0 +1,550 @@
+#!/usr/bin/env zsh
+
+# tree-dump: Interactive directory tree dumper with smart filtering
+# Usage: tree-dump [directory]
+#        tree-dump --update <dump-file>
+#        tree-dump --diff <dump-file>
+
+set -e
+
+# Colors for better UX
+autoload -U colors && colors
+
+# Default values
+DEFAULT_DEPTH=3
+DEFAULT_OUTPUT="stdout"
+
+# Common exclusion patterns
+COMMON_EXCLUDES=(
+    "node_modules"
+    ".git"
+    "dist"
+    "build"
+    ".next"
+    ".cache"
+    "coverage"
+    ".vscode"
+    ".idea"
+    "*.log"
+    ".DS_Store"
+    "vendor"
+    "__pycache__"
+    "*.pyc"
+    ".env"
+    ".env.local"
+)
+
+# Presets for common use cases
+declare -A PRESETS
+PRESETS[code]="*.ts,*.tsx,*.js,*.jsx,*.py,*.go,*.rs,*.java,*.c,*.cpp,*.h"
+PRESETS[docs]="*.md,*.txt,*.rst,*.adoc,*.pdf"
+PRESETS[config]="*.json,*.yaml,*.yml,*.toml,*.ini,*.conf,*.config.*"
+PRESETS[web]="*.html,*.css,*.scss,*.sass,*.vue,*.svelte"
+
+# Helper function to prompt with default
+prompt_with_default() {
+    local prompt_text="$1"
+    local default_value="$2"
+    local result
+
+    read -r "result?${fg[cyan]}${prompt_text}${reset_color} ${fg[yellow]}[${default_value}]${reset_color}: "
+    echo "${result:-$default_value}"
+}
+
+# Helper function for yes/no prompts
+prompt_yes_no() {
+    local prompt_text="$1"
+    local default_value="$2"
+    local result
+
+    local default_display="y/N"
+    [[ "$default_value" == "y" ]] && default_display="Y/n"
+
+    read -r "result?${fg[cyan]}${prompt_text}${reset_color} ${fg[yellow]}[${default_display}]${reset_color}: "
+    result="${result:-$default_value}"
+    [[ "$result" =~ ^[Yy] ]] && echo "y" || echo "n"
+}
+
+# Helper function for multiselect
+prompt_multiselect() {
+    local prompt_text="$1"
+    shift
+    local options=("$@")
+
+    echo "${fg[cyan]}${prompt_text}${reset_color}"
+    for i in {1..$#options}; do
+        echo "  ${fg[yellow]}${i})${reset_color} ${options[$i]}"
+    done
+    read -r "selection?${fg[cyan]}Enter numbers (space-separated, or 'all'):${reset_color} "
+
+    if [[ "$selection" == "all" ]]; then
+        echo "${options[@]}"
+    else
+        local selected=()
+        for num in ${=selection}; do
+            if [[ $num -ge 1 && $num -le $#options ]]; then
+                selected+=("${options[$num]}")
+            fi
+        done
+        echo "${selected[@]}"
+    fi
+}
+
+# Print banner
+print_banner() {
+    echo "${fg[green]}╔════════════════════════════════════════════╗${reset_color}"
+    echo "${fg[green]}║${reset_color}   ${fg_bold[white]}Directory Tree Dump Utility${reset_color}          ${fg[green]}║${reset_color}"
+    echo "${fg[green]}╚════════════════════════════════════════════╝${reset_color}"
+    echo
+}
+
+# Parse existing dump file to extract metadata and tree structure
+parse_dump_file() {
+    local dump_file="$1"
+    local output_var="$2"
+
+    if [[ ! -f "$dump_file" ]]; then
+        echo "${fg[red]}Error: Dump file '$dump_file' does not exist${reset_color}"
+        return 1
+    fi
+
+    # Extract directory from dump file
+    local orig_dir=$(grep "^# Directory:" "$dump_file" | sed 's/^# Directory: //')
+    local orig_depth=$(grep "^# Depth:" "$dump_file" | sed 's/^# Depth: //')
+    local orig_pattern=$(grep "^# Pattern:" "$dump_file" | sed 's/^# Pattern: //')
+    local orig_command=$(grep "^# Command:" "$dump_file" | sed 's/^# Command: //')
+
+    # Extract the tree structure (skip header lines starting with #)
+    local tree_content=$(grep -v "^#" "$dump_file")
+
+    # Store in associative array
+    eval "${output_var}[dir]='${orig_dir}'"
+    eval "${output_var}[depth]='${orig_depth}'"
+    eval "${output_var}[pattern]='${orig_pattern}'"
+    eval "${output_var}[command]='${orig_command}'"
+    eval "${output_var}[tree]='${tree_content}'"
+}
+
+# Extract file paths from tree output (strip ANSI codes and tree characters)
+extract_paths_from_tree() {
+    local tree_output="$1"
+
+    echo "$tree_output" | \
+        # Remove ANSI color codes
+        sed 's/\x1B\[[0-9;]*[mGKH]//g' | \
+        # Remove tree characters and keep only paths
+        grep -E "├──|└──" | \
+        sed -E 's/.*[├└]── //' | \
+        # Remove trailing / and file type indicators
+        sed 's/[/@*=|]$//' | \
+        sort
+}
+
+# Compare two trees and show differences
+diff_trees() {
+    local old_tree="$1"
+    local new_tree="$2"
+
+    # Create temp files for comparison
+    local old_paths=$(mktemp)
+    local new_paths=$(mktemp)
+
+    extract_paths_from_tree "$old_tree" > "$old_paths"
+    extract_paths_from_tree "$new_tree" > "$new_paths"
+
+    # Find added files
+    local added=$(comm -13 "$old_paths" "$new_paths")
+    local removed=$(comm -23 "$old_paths" "$new_paths")
+    local unchanged=$(comm -12 "$old_paths" "$new_paths")
+
+    local added_count=$(echo "$added" | grep -c . || echo 0)
+    local removed_count=$(echo "$removed" | grep -c . || echo 0)
+    local unchanged_count=$(echo "$unchanged" | grep -c . || echo 0)
+
+    # Display results
+    echo
+    echo "${fg[green]}╔════════════════════════════════════════════╗${reset_color}"
+    echo "${fg[green]}║${reset_color}   ${fg_bold[white]}Change Detection Report${reset_color}              ${fg[green]}║${reset_color}"
+    echo "${fg[green]}╚════════════════════════════════════════════╝${reset_color}"
+    echo
+
+    echo "${fg[cyan]}Summary:${reset_color}"
+    echo "  ${fg[green]}Added:${reset_color}     ${added_count} items"
+    echo "  ${fg[red]}Removed:${reset_color}   ${removed_count} items"
+    echo "  ${fg[yellow]}Unchanged:${reset_color} ${unchanged_count} items"
+    echo
+
+    if [[ $added_count -gt 0 ]]; then
+        echo "${fg[green]}✓ Added files/directories:${reset_color}"
+        echo "$added" | while read -r path; do
+            [[ -n "$path" ]] && echo "  ${fg[green]}+ ${path}${reset_color}"
+        done
+        echo
+    fi
+
+    if [[ $removed_count -gt 0 ]]; then
+        echo "${fg[red]}✗ Removed files/directories:${reset_color}"
+        echo "$removed" | while read -r path; do
+            [[ -n "$path" ]] && echo "  ${fg[red]}- ${path}${reset_color}"
+        done
+        echo
+    fi
+
+    # Cleanup
+    rm -f "$old_paths" "$new_paths"
+
+    # Return counts for caller
+    echo "$added_count:$removed_count:$unchanged_count"
+}
+
+# Update mode: regenerate dump and show diff
+update_dump() {
+    local dump_file="$1"
+
+    print_banner
+    echo "${fg[cyan]}Update Mode:${reset_color} Comparing with existing dump"
+    echo "${fg[cyan]}Dump file:${reset_color} ${dump_file}"
+    echo
+
+    # Parse existing dump
+    declare -A old_dump
+    parse_dump_file "$dump_file" old_dump || return 1
+
+    local target_dir="${old_dump[dir]}"
+    local depth="${old_dump[depth]}"
+
+    echo "${fg[cyan]}Original directory:${reset_color} ${target_dir}"
+    echo "${fg[cyan]}Original depth:${reset_color} ${depth}"
+    echo
+
+    # Check if directory still exists
+    if [[ ! -d "$target_dir" ]]; then
+        echo "${fg[red]}Error: Original directory no longer exists${reset_color}"
+        return 1
+    fi
+
+    # Ask if user wants to use same settings or customize
+    local use_same=$(prompt_yes_no "Use same settings as original dump?" "y")
+
+    if [[ "$use_same" == "y" ]]; then
+        # Re-run the original command
+        echo "${fg[cyan]}Re-running original command...${reset_color}"
+        echo "${fg[yellow]}${old_dump[command]}${reset_color}"
+        echo
+
+        # Extract just the tree command part
+        local tree_cmd=$(echo "${old_dump[command]}" | sed 's/^tree //')
+        local new_tree=$(eval "tree $tree_cmd" 2>/dev/null || echo "Tree generation failed")
+
+        # Compare
+        local diff_result=$(diff_trees "${old_dump[tree]}" "$new_tree")
+
+        # Ask if user wants to save the updated dump
+        local save_update=$(prompt_yes_no "Save updated dump?" "y")
+
+        if [[ "$save_update" == "y" ]]; then
+            # Generate new filename or overwrite
+            local overwrite=$(prompt_yes_no "Overwrite original file?" "n")
+
+            local new_file="$dump_file"
+            if [[ "$overwrite" == "n" ]]; then
+                local base="${dump_file%.txt}"
+                new_file="${base}-updated-$(date +%Y%m%d-%H%M%S).txt"
+            fi
+
+            # Build new header
+            local header=""
+            header+="# Directory Tree Dump\n"
+            header+="# Generated: $(date '+%Y-%m-%d %H:%M:%S')\n"
+            header+="# Updated from: $(basename "$dump_file")\n"
+            header+="# Directory: ${target_dir}\n"
+            header+="# Depth: ${depth}\n"
+            [[ -n "${old_dump[pattern]}" ]] && header+="# Pattern: ${old_dump[pattern]}\n"
+            header+="# Command: ${old_dump[command]}\n"
+            header+="\n"
+
+            echo "${header}${new_tree}" > "$new_file"
+            echo "${fg[green]}✓ Updated dump saved to: ${new_file}${reset_color}"
+        fi
+    else
+        # Start interactive mode with pre-filled directory
+        main "$target_dir"
+    fi
+}
+
+# Diff-only mode: show changes without updating
+diff_only() {
+    local dump_file="$1"
+
+    print_banner
+    echo "${fg[cyan]}Diff Mode:${reset_color} Showing changes since last dump"
+    echo "${fg[cyan]}Dump file:${reset_color} ${dump_file}"
+    echo
+
+    # Parse existing dump
+    declare -A old_dump
+    parse_dump_file "$dump_file" old_dump || return 1
+
+    local target_dir="${old_dump[dir]}"
+
+    echo "${fg[cyan]}Original directory:${reset_color} ${target_dir}"
+    echo "${fg[cyan]}Original dump date:${reset_color} $(grep "^# Generated:" "$dump_file" | sed 's/^# Generated: //')"
+    echo
+
+    # Check if directory still exists
+    if [[ ! -d "$target_dir" ]]; then
+        echo "${fg[red]}Error: Original directory no longer exists${reset_color}"
+        return 1
+    fi
+
+    # Re-run the original command
+    echo "${fg[cyan]}Scanning current state...${reset_color}"
+    local tree_cmd=$(echo "${old_dump[command]}" | sed 's/^tree //')
+    local new_tree=$(eval "tree $tree_cmd" 2>/dev/null || echo "Tree generation failed")
+
+    # Compare and show diff
+    diff_trees "${old_dump[tree]}" "$new_tree"
+}
+
+# Main function
+main() {
+    print_banner
+
+    # Get target directory
+    local target_dir="${1:-.}"
+    if [[ ! -d "$target_dir" ]]; then
+        echo "${fg[red]}Error: Directory '$target_dir' does not exist${reset_color}"
+        exit 1
+    fi
+
+    # Convert to absolute path
+    target_dir="$(cd "$target_dir" && pwd)"
+    echo "${fg[green]}Target directory:${reset_color} ${target_dir}"
+    echo
+
+    # Prompt for directory description
+    read -r "dir_description?${fg[cyan]}Describe this directory (purpose/context):${reset_color} "
+
+    # Prompt for depth
+    local depth=$(prompt_with_default "Maximum depth level" "$DEFAULT_DEPTH")
+
+    # Ask about using preset
+    local use_preset=$(prompt_yes_no "Use a preset filter?" "n")
+    local pattern=""
+
+    if [[ "$use_preset" == "y" ]]; then
+        echo "${fg[cyan]}Available presets:${reset_color}"
+        echo "  ${fg[yellow]}1)${reset_color} code    - Source code files"
+        echo "  ${fg[yellow]}2)${reset_color} docs    - Documentation files"
+        echo "  ${fg[yellow]}3)${reset_color} config  - Configuration files"
+        echo "  ${fg[yellow]}4)${reset_color} web     - Web assets"
+        read -r "preset_choice?${fg[cyan]}Select preset (1-4):${reset_color} "
+
+        case $preset_choice in
+            1) pattern="${PRESETS[code]}" ;;
+            2) pattern="${PRESETS[docs]}" ;;
+            3) pattern="${PRESETS[config]}" ;;
+            4) pattern="${PRESETS[web]}" ;;
+            *) echo "${fg[red]}Invalid preset, skipping filter${reset_color}" ;;
+        esac
+    else
+        # Ask for custom pattern
+        read -r "pattern?${fg[cyan]}File pattern (e.g., *.ts,*.md) or leave empty for all:${reset_color} "
+    fi
+
+    # Ask about exclusions
+    local use_common_excludes=$(prompt_yes_no "Use common exclusions (node_modules, .git, etc)?" "y")
+
+    local custom_excludes=""
+    read -r "custom_excludes?${fg[cyan]}Additional exclusions (comma-separated, or leave empty):${reset_color} "
+
+    # Ask about git integration
+    local git_only="n"
+    if [[ -d "$target_dir/.git" ]]; then
+        git_only=$(prompt_yes_no "Show only git-tracked files?" "n")
+    fi
+
+    # Ask about additional options
+    local show_sizes=$(prompt_yes_no "Show file sizes?" "n")
+    local show_hidden=$(prompt_yes_no "Show hidden files?" "y")
+    local dirs_only=$(prompt_yes_no "Show directories only?" "n")
+
+    # Ask about output destination
+    echo "${fg[cyan]}Output destination:${reset_color}"
+    echo "  ${fg[yellow]}1)${reset_color} Display in terminal"
+    echo "  ${fg[yellow]}2)${reset_color} Save to file"
+    echo "  ${fg[yellow]}3)${reset_color} Both (display and save)"
+    read -r "output_choice?${fg[cyan]}Select (1-3):${reset_color} "
+
+    local output_file=""
+    if [[ "$output_choice" =~ ^[23]$ ]]; then
+        local default_filename="tree-$(basename "$target_dir")-$(date +%Y%m%d-%H%M%S).txt"
+        output_file=$(prompt_with_default "Output filename" "$default_filename")
+    fi
+
+    # Build tree command
+    local tree_cmd="tree"
+    local tree_args=()
+
+    # Add depth
+    tree_args+=("-L" "$depth")
+
+    # Add pattern
+    if [[ -n "$pattern" ]]; then
+        tree_args+=("-P" "$pattern")
+    fi
+
+    # Add exclusions
+    if [[ "$use_common_excludes" == "y" ]]; then
+        for exclude in "${COMMON_EXCLUDES[@]}"; do
+            tree_args+=("-I" "$exclude")
+        done
+    fi
+
+    if [[ -n "$custom_excludes" ]]; then
+        IFS=',' read -A custom_exclude_array <<< "$custom_excludes"
+        for exclude in "${custom_exclude_array[@]}"; do
+            tree_args+=("-I" "${exclude## }")
+        done
+    fi
+
+    # Add options
+    [[ "$show_sizes" == "y" ]] && tree_args+=("-h")
+    [[ "$show_hidden" == "y" ]] && tree_args+=("-a")
+    [[ "$dirs_only" == "y" ]] && tree_args+=("-d")
+
+    # Always add file count, full path, and colors
+    tree_args+=("--dirsfirst" "-F" "-C")
+
+    # Build header
+    local header=""
+    header+="# Directory Tree Dump\n"
+    header+="# Generated: $(date '+%Y-%m-%d %H:%M:%S')\n"
+    header+="# Directory: ${target_dir}\n"
+    [[ -n "$dir_description" ]] && header+="# Description: ${dir_description}\n"
+    header+="# Depth: ${depth}\n"
+    [[ -n "$pattern" ]] && header+="# Pattern: ${pattern}\n"
+    [[ "$use_common_excludes" == "y" ]] && header+="# Common exclusions: enabled\n"
+    [[ -n "$custom_excludes" ]] && header+="# Custom exclusions: ${custom_excludes}\n"
+    [[ "$git_only" == "y" ]] && header+="# Git tracked only: yes\n"
+    header+="# Command: tree ${tree_args[@]} ${target_dir}\n"
+    header+="\n"
+
+    echo
+    echo "${fg[green]}Generating tree...${reset_color}"
+    echo
+
+    # Generate tree output
+    local tree_output=""
+
+    if [[ "$git_only" == "y" ]]; then
+        # Use git ls-files and construct tree from that
+        echo "${fg[yellow]}Note: Git-only mode uses a simplified tree format${reset_color}"
+        tree_output=$(cd "$target_dir" && git ls-files | tree --fromfile -L "$depth" 2>/dev/null || echo "Git tree generation failed")
+    else
+        tree_output=$($tree_cmd "${tree_args[@]}" "$target_dir" 2>/dev/null || echo "Tree generation failed")
+    fi
+
+    # Combine header and tree output
+    local full_output="${header}${tree_output}"
+
+    # Output based on user choice
+    case $output_choice in
+        1)
+            # Display only
+            echo "$full_output"
+            ;;
+        2)
+            # Save only
+            echo "$full_output" > "$output_file"
+            echo "${fg[green]}✓ Saved to: ${output_file}${reset_color}"
+            echo "${fg[cyan]}Lines: $(wc -l < "$output_file")${reset_color}"
+            ;;
+        3)
+            # Both
+            echo "$full_output"
+            echo "$full_output" > "$output_file"
+            echo
+            echo "${fg[green]}✓ Saved to: ${output_file}${reset_color}"
+            ;;
+    esac
+
+    # Show statistics
+    echo
+    echo "${fg[green]}╔════════════════════════════════════════════╗${reset_color}"
+    echo "${fg[green]}║${reset_color}   ${fg_bold[white]}Statistics${reset_color}                           ${fg[green]}║${reset_color}"
+    echo "${fg[green]}╚════════════════════════════════════════════╝${reset_color}"
+
+    # Count files and directories
+    local file_count=$(echo "$tree_output" | grep -c "├──\|└──" || echo "0")
+    local dir_count=$(find "$target_dir" -maxdepth "$depth" -type d | wc -l)
+
+    echo "${fg[cyan]}Files found:${reset_color} ${file_count}"
+    echo "${fg[cyan]}Directories (max depth ${depth}):${reset_color} ${dir_count}"
+
+    # Show file extension breakdown if not dirs-only
+    if [[ "$dirs_only" == "n" ]]; then
+        echo
+        echo "${fg[cyan]}Top file extensions:${reset_color}"
+        find "$target_dir" -maxdepth "$depth" -type f |
+            sed 's/.*\.//' |
+            sort |
+            uniq -c |
+            sort -rn |
+            head -10 |
+            while read count ext; do
+                echo "  ${fg[yellow]}${ext}:${reset_color} ${count}"
+            done
+    fi
+}
+
+# Check if tree is installed
+if ! command -v tree &> /dev/null; then
+    echo "${fg[red]}Error: 'tree' command not found${reset_color}"
+    echo "Install it with:"
+    echo "  macOS: ${fg[cyan]}brew install tree${reset_color}"
+    echo "  Linux: ${fg[cyan]}apt-get install tree${reset_color} or ${fg[cyan]}yum install tree${reset_color}"
+    exit 1
+fi
+
+# Parse command line arguments
+case "${1}" in
+    --update|-u)
+        if [[ -z "$2" ]]; then
+            echo "${fg[red]}Error: --update requires a dump file path${reset_color}"
+            echo "Usage: tree-dump --update <dump-file>"
+            exit 1
+        fi
+        update_dump "$2"
+        ;;
+    --diff|-d)
+        if [[ -z "$2" ]]; then
+            echo "${fg[red]}Error: --diff requires a dump file path${reset_color}"
+            echo "Usage: tree-dump --diff <dump-file>"
+            exit 1
+        fi
+        diff_only "$2"
+        ;;
+    --help|-h)
+        print_banner
+        echo "Usage:"
+        echo "  ${fg[cyan]}tree-dump [directory]${reset_color}"
+        echo "    Interactive mode - create a new tree dump"
+        echo
+        echo "  ${fg[cyan]}tree-dump --update <dump-file>${reset_color}"
+        echo "    Update an existing dump and show changes"
+        echo
+        echo "  ${fg[cyan]}tree-dump --diff <dump-file>${reset_color}"
+        echo "    Show changes since last dump (read-only)"
+        echo
+        echo "Options:"
+        echo "  -h, --help     Show this help message"
+        echo "  -u, --update   Update mode"
+        echo "  -d, --diff     Diff-only mode"
+        echo
+        ;;
+    *)
+        # Regular interactive mode
+        main "$@"
+        ;;
+esac
