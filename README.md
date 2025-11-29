@@ -150,21 +150,3 @@ Top file extensions:
   ts: 4
   json: 2
 ```
-
-### Tips
-
-1. **Start shallow**: Use depth 2-3 for large directories, increase as needed
-2. **Use presets**: Faster than typing custom patterns
-3. **Common exclusions**: Almost always want this enabled
-4. **Save important dumps**: Use "Both" output to review and keep a record
-5. **Add descriptions**: Future-you will thank you for context
-
-### Color Scheme
-
-- 🟦 **Directories**: Blue with bold
-- 🟩 **Executables**: Green
-- 🟪 **Archives**: Magenta
-- 🟨 **Images**: Yellow
-- ⬜ **Regular files**: Default color
-
-Colors are automatically enabled and follow your terminal's color scheme.
